@@ -28,6 +28,7 @@
 
   class SpoofDate extends Date {
     #ad; // adjusted date
+    #isNow = false; // whether it's getting the current time, i.e., new Date()
 
     #sync() {
       const offset = (prefs.offset + super.getTimezoneOffset());
@@ -37,11 +38,18 @@
     constructor(...args) {
       super(...args);
 
+      if (args.length === 0) {
+        this.#isNow = true;
+      }
+
+      // Ensure the instance's prototype is SpoofDate.prototype
+      Object.setPrototypeOf(this, SpoofDate.prototype);
       prefs.updates.push(() => this.#sync());
       this.#sync();
     }
+
     getTimezoneOffset() {
-      return prefs.offset;
+      return 0 - prefs.offset;
     }
     /* to string (only supports en locale) */
     toTimeString() {
@@ -98,7 +106,12 @@
     }
     /* get */
     #get(name, ...args) {
-      return super[name].call(this.#ad, ...args);
+      if (this.#isNow) {
+        // Directly return the current time
+        return super[name].call(this.#ad, ...args);
+      }
+      else
+        return super[name].call(this, ...args);
     }
     getDate(...args) {
       return this.#get('getDate', ...args);
@@ -174,32 +187,111 @@
     }
   }
 
+/* Bypass detection */
+
+// Use a wrapper function to simulate native Date's behavior
+  function SpoofDateWrapper(...args) {
+    // If not called with new, then return new SpoofDate(...args).toString()
+    if (!(this instanceof SpoofDateWrapper)) {
+      return new SpoofDate(...args).toString();
+    }
+    return new SpoofDate(...args);
+  }
+
+  // Make SpoofDateWrapper inherit from SpoofDate's prototype chain
+  SpoofDateWrapper.prototype = SpoofDate.prototype;
+  SpoofDateWrapper.prototype.constructor = SpoofDateWrapper;
+
+  // Sync SpoofDateWrapper's static properties and methods from native Date (OriginalDate)
+  Object.getOwnPropertyNames(OriginalDate).forEach(prop => {
+    if (!(prop in SpoofDateWrapper)) {
+      try {
+        const desc = Object.getOwnPropertyDescriptor(OriginalDate, prop);
+        Object.defineProperty(SpoofDateWrapper, prop, desc);
+      } catch (e) {
+        // Some properties may not be defined, ignore errors
+      }
+    }
+  });
+
+  // Set the constructor's length to 7
+  Object.defineProperty(SpoofDateWrapper, "length", { value: 7 });
+  // Set the name property to "Date"
+  Object.defineProperty(SpoofDateWrapper, "name", { value: "Date" });
+  // Override toString so that it returns the native Date's code string
+  SpoofDateWrapper.toString = function () {
+    return "function Date() { [native code] }";
+  };
+
+  // Set SpoofDate's prototype to the native Date's prototype (so instances have native Date's methods)
+  SpoofDate.prototype = OriginalDate.prototype;
+
+  // Override getTimezoneOffset method's toString to mimic native code output
+  Object.defineProperty(SpoofDate.prototype.getTimezoneOffset, 'toString', {
+    value: function () {
+      return 'function getTimezoneOffset() { [native code] }';
+    },
+    writable: false,
+    configurable: false
+  });
+
   /* override */
-  self.Date = SpoofDate;
-  self.Date = new Proxy(Date, {
-    apply(target, self, args) {
-      return new SpoofDate(...args);
+  // Use Proxy to replace the global Date, intercepting both function calls and constructor calls
+  self.Date = new Proxy(SpoofDateWrapper, {
+    apply(target, thisArg, argumentsList) {
+      // When called as a function
+      return target(...argumentsList);
+    },
+    construct(target, argumentsList, newTarget) {
+      // When called with new
+      if (argumentsList.length === 1 && typeof argumentsList[0] === "string") {
+        const dateStr = argumentsList[0];
+        // Adjust parsing logic based on different formats:
+        if (/\d{2}\/\d{2}\/\d{4}/.test(dateStr)) {
+          // MM/DD/YYYY format: use custom local time parsing logic
+          const timestamp = OriginalDate.parse(dateStr);
+          return new target(timestamp);
+        }
+        else if (/\d{4}-\d{2}-\d{2}/.test(dateStr)) {
+          // YYYY-MM-DD format: treat as UTC time
+          const timestamp = OriginalDate.parse(dateStr);
+          now = new OriginalDate();
+          const offset = (prefs.offset + now.getTimezoneOffset());
+          return new target(timestamp + offset * 60 * 1000);
+        }
+      }
+      return new target(...argumentsList);
     }
   });
 
   /* Intl Spoofing */
   class SpoofDateTimeFormat extends Intl.DateTimeFormat {
     constructor(...args) {
+      // Ensure the options object exists
       if (!args[1]) {
         args[1] = {};
       }
+      // If no timeZone is specified, use the value from port
       if (!args[1].timeZone) {
         args[1].timeZone = port.dataset.timezone;
       }
-
       super(...args);
     }
+    // Override resolvedOptions method to return spoofed timezone information
+    resolvedOptions() {
+      let options = super.resolvedOptions();
+      options.timeZone = port.dataset.timezone;
+      return options;
+    }
   }
-  Intl.DateTimeFormat = SpoofDateTimeFormat;
 
-  Intl.DateTimeFormat = new Proxy(Intl.DateTimeFormat, {
-    apply(target, self, args) {
-      return new Intl.DateTimeFormat(...args);
+  // Use Proxy to wrap SpoofDateTimeFormat, ensuring the call behavior is identical to native
+  Intl.DateTimeFormat = new Proxy(SpoofDateTimeFormat, {
+    apply(target, thisArg, args) {
+      return new SpoofDateTimeFormat(...args);
+    },
+    construct(target, args) {
+      return new SpoofDateTimeFormat(...args);
     }
   });
 }
@@ -213,6 +305,6 @@ window.addEventListener('message', e => {
       e.source.Date = Date;
       e.source.Intl.DateTimeFormat = Intl.DateTimeFormat;
     }
-    catch (e) {}
+    catch (e) { }
   }
 });
